@@ -234,8 +234,9 @@ async def _close_ws(ws: WebSocket, code: int = 1000) -> None:
 class _SubscriberSender:
     """单个 WS 订阅者的发送通道:有界队列 + 独立发送协程。
 
-    「卡顿」与「失联」两个时间尺度分离——卡顿只丢数据:队列满丢最旧,网络
-    恢复后自动续发最新帧,连接保留;send 连续挂起超 _LIVENESS_S 才判死,经
+    「卡顿」与「失联」两个时间尺度分离——卡顿只丢数据:队列满丢最旧数据帧
+    (init 等控制消息不淘汰,见 offer),网络恢复后自动续发最新帧,连接保留;
+    send 连续挂起超 _LIVENESS_S 才判死,经
     on_dead 逐出并按需停流,此后 offer 被 closed 挡掉(生产端不再往队列塞
     数据)。判死必须应用层做:uvicorn keepalive 的 disconnect 要等 TCP 重传
     耗尽(~1h)才到应用层,即 v2026.8.6 事故根因。队列容量:视频 8(容纳
@@ -295,11 +296,16 @@ class _SubscriberSender:
             )
 
     def offer(self, kind: str, data: Any) -> None:
-        """生产端投递:永不阻塞,队列满丢最旧。"""
+        """生产端投递:永不阻塞,队列满丢最旧数据帧(控制消息不淘汰)。
+
+        init 是「首条消息是 init」协议的载体且只投递一次、无补发路径——
+        被数据挤出后客户端永远拿不到解码参数(watch.html 会丢弃全部二进制
+        帧)。所以淘汰只落在数据帧上;队列被控制消息填满才轮到最旧的控制
+        消息(一条连接至多一两条,实际到不了)。
+        """
         if self.closed:
             return
         if len(self._queue) == self._queue.maxlen:
-            self._queue.popleft()
             if not self._drop_logged:
                 logger.warning(
                     "WebSocket send stalled, drop stale data, %s, %s, %s",
@@ -308,6 +314,13 @@ class _SubscriberSender:
                     _safe_log(self.cid),
                 )
                 self._drop_logged = True
+            # 跳过控制消息,只淘汰最旧的数据帧
+            for i, (k, _) in enumerate(self._queue):
+                if k != _MSG_TEXT:
+                    del self._queue[i]
+                    break
+            else:
+                self._queue.popleft()
         self._queue.append((kind, data))
         self._event.set()
 

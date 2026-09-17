@@ -19,6 +19,7 @@ import pytest
 from fastapi.websockets import WebSocketState
 from miloco.miot.ws import (
     _MSG_BYTES,
+    _MSG_TEXT,
     MIoTAudioStreamManager,
     MIoTVideoStreamManager,
     _SubscriberSender,
@@ -81,6 +82,22 @@ class _ScriptedWS:
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
         self.closed = True
         self.close_code = code
+
+
+class _OrderRecordingWS(_ScriptedWS):
+    """记录 text/bytes 的实际发送先后(判定「init 先于数据送达」用)。"""
+
+    def __init__(self, mode: str = "healthy"):
+        super().__init__(mode)
+        self.order: list[str] = []
+
+    async def send_text(self, text: str) -> None:
+        await super().send_text(text)
+        self.order.append("text")
+
+    async def send_bytes(self, payload: bytes) -> None:
+        await super().send_bytes(payload)
+        self.order.append("bytes")
 
 
 def _attach_video(mgr, ws, tag="cam.0", user="u", cid="c0") -> _SubscriberSender:
@@ -274,6 +291,33 @@ async def test_frame_storm_bounded_and_stops_stream(fake_manager):
     fake_manager.stop_video_stream.assert_awaited_once_with("cam", 0, 7)
 
 
+async def test_cached_init_survives_burst_before_sender_scheduled(fake_manager):
+    """late-joiner cached init 不能被数据突发挤出队列。
+
+    new_connection 把 cached init 与数据帧放进同一条队列(maxsize=8)。发送
+    协程获得调度前,若积压超过容量,init 一旦被挤出客户端就永远拿不到解码
+    参数(watch.html 无 codecHint 会丢弃全部二进制帧)且服务端无补发路径。
+    """
+    mgr = MIoTVideoStreamManager()
+    mgr._camera_codec["cam.0"] = MIoTCameraCodec.VIDEO_H264
+    ws = _OrderRecordingWS()
+    sender = _attach_video(mgr, ws)
+
+    # 复刻 new_connection 的 cached-init 投递;随后的突发灌帧走真实 fanout。
+    # _broadcast 内部无挂起点,连续 await 不会让出事件循环 → 整批数据都落在
+    # 发送协程首次调度之前(即 init 仍在队列里时队列已被灌满)。
+    sender.offer(_MSG_TEXT, mgr._build_init_msg(MIoTCameraCodec.VIDEO_H264))
+    for i in range(1, 10):  # 9 帧 > maxsize=8
+        await mgr._broadcast("cam.0", payload=f"n{i}".encode())
+
+    await _wait_sent(ws, 8)
+    assert ws.texts == [mgr._build_init_msg(MIoTCameraCodec.VIDEO_H264)]
+    # 被挤掉的是最旧的数据帧,不是 init;且 init 先于全部数据送达
+    assert ws.sent == [f"n{i}".encode() for i in range(3, 10)]
+    assert ws.order == ["text"] + ["bytes"] * 7
+    await _stop(sender)
+
+
 async def test_close_connection_cancels_sender(fake_manager):
     """route 侧正常断开:发送协程必须被回收(不泄漏)。"""
     mgr = MIoTVideoStreamManager()
@@ -340,6 +384,32 @@ async def test_audio_liveness_timeout_evicts_and_stops_stream(fake_manager):
     assert "cam.0" not in mgr._camera_init_done
     fake_manager.stop_audio_stream.assert_awaited_once_with("cam", 0)
     assert ws.closed and ws.close_code == 1001
+
+
+async def test_audio_init_survives_burst_before_sender_scheduled(fake_manager):
+    """音频首帧路径:init 不能被数据突发挤出队列。
+
+    首帧回调把 init 与后续帧放进同一条队列(maxsize=25),发送协程获得调度
+    前若积压超过容量,init 被挤出后 _camera_init_done 已置位、永不补发,
+    客户端拿不到 codec/采样率/声道,只剩一堆解不了的二进制帧。
+    """
+    mgr = MIoTAudioStreamManager()
+    ws = _OrderRecordingWS()
+    sender = _attach_audio(mgr, ws)
+    fake_manager.get_audio_codec = lambda *a, **k: "opus"
+
+    # 首帧回调投 init+p0;回调内无挂起点,连续 await 不会让出事件循环 →
+    # 后续突发全部落在发送协程首次调度之前(init 仍在队列里时队列已灌满)。
+    await _audio_callback(mgr)("cam", b"p0", 0, 0, 0)
+    for i in range(1, 27):  # 26 帧 > maxsize=25
+        await _audio_callback(mgr)("cam", f"p{i}".encode(), i, 0, 0)
+
+    await _wait_sent(ws, 25)
+    assert ws.texts == [_init_json("opus")]
+    # 被挤掉的是最旧的数据帧(p0/p1/p2),不是 init;且 init 先于全部数据送达
+    assert ws.sent == [f"p{i}".encode() for i in range(3, 27)]
+    assert ws.order == ["text"] + ["bytes"] * 24
+    await _stop(sender)
 
 
 async def test_audio_healthy_passthrough_order(fake_manager):
